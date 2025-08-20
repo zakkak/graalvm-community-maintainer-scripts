@@ -95,18 +95,36 @@ public class review implements Callable<Integer> {
         checkBackportCommits(pr, upstreamPR);
 
         // 3. Check if the linked backport issue references the upstream PR being backported
+        checkClosingIssue(pr, upstreamPR);
+    }
+
+    private void checkClosingIssue(GHPullRequest pr, GHPullRequest upstreamPR) throws IOException {
+        String description = pr.getBody();
         int backportIssue = extractBackportIssue(description);
         if (backportIssue == -1) {
             out.println("❌ No backport issue found in:");
             out.println(description);
             return;
         }
-        if (upstreamRepo.getIssue(backportIssue).getBody().contains(upstreamRepository + "/" + upstreamPRNumber)) {
+        String body = pr.getRepository().getIssue(backportIssue).getBody();
+        String commitRegex = upstreamRepository + "/commit/([a-f0-9]{40})";
+        Matcher issueMatcher = Pattern.compile(commitRegex).matcher(body);
+        if (body.contains(upstreamRepository + "/" + upstreamPR.getNumber())) {
             out.println("✅ Backport issue references upstream PR.");
-        } else {
-            out.println("❌ Backport issue does not reference upstream PR:");
-            out.println(description);
+            return;
+        } else if (issueMatcher.find()) {
+            String commitSHA = issueMatcher.group(1);
+            for (GHPullRequestCommitDetail commit : pr.listCommits()) {
+                String message = commit.getCommit().getMessage();
+                String cherryPickMessage = "(cherry picked from commit " + commitSHA + ")";
+                if (message.contains(cherryPickMessage)) {
+                    out.println("✅ Backport issue references upstream commit: " + commitSHA);
+                    return;
+                }
+            }
         }
+        out.println("❌ Backport issue does not reference upstream PR:");
+        out.println(description);
     }
 
     private void checkBackportCommits(GHPullRequest pr, GHPullRequest upstreamPR) {
