@@ -37,23 +37,31 @@ public class review implements Callable<Integer> {
     @Option(names = {"-p", "--pr"}, description = "The pull request number to review.")
     private Integer pullRequestNumber;
 
+    @Option(names = {"-t", "--token"}, description = "Github token to use when calling the Github API")
+    private String token;
+
     public static void main(String... args) {
         int exitCode = new CommandLine(new review()).execute(args);
         System.exit(exitCode);
     }
 
-    static final GitHub github;
-
-    static {
-        try {
-            github = new GitHubBuilder().build();
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to initialize GitHub instance", e);
-        }
-    }
+    static GitHub github;
 
     @Override
     public Integer call() throws IOException {
+
+        // Setup github object
+        try {
+            if (token != null) {
+                github = new GitHubBuilder().withOAuthToken(token).build();
+            } else {
+                github = new GitHubBuilder().build();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to initialize GitHub instance", e);
+        }
+
+
         GHRepository repo = github.getRepository(repository);
 
         if (pullRequestNumber == null) {
