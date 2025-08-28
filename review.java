@@ -109,7 +109,7 @@ public class review implements Callable<Integer> {
         String body = pr.getRepository().getIssue(backportIssue).getBody();
         String commitRegex = upstreamRepository + "/commit/([a-f0-9]{40})";
         Matcher issueMatcher = Pattern.compile(commitRegex).matcher(body);
-        if (body.contains(upstreamRepository + "/" + upstreamPR.getNumber())) {
+        if (body.contains(upstreamRepository + "/pull/" + upstreamPR.getNumber())) {
             out.println("✅ Backport issue references upstream PR.");
             return;
         } else if (issueMatcher.find()) {
