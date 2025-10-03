@@ -1,5 +1,5 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
-//DEPS org.kohsuke:github-api:1.329
+//DEPS org.kohsuke:github-api:1.330
 //DEPS info.picocli:picocli:4.7.7
 
 import static java.lang.System.out;
@@ -78,6 +78,9 @@ public class review implements Callable<Integer> {
 
     private void reviewPR(GHPullRequest pr) throws IOException {
         String description = pr.getBody();
+
+        // Remove html comments from the description
+        description = description.replaceAll("(?s)<!--.*?-->", "").trim();
 
         int upstreamPRNumber = extractPullRequestNumber(description);
         if (upstreamPRNumber == -1) {
