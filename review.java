@@ -7,6 +7,8 @@ import static java.lang.System.out;
 import java.io.IOException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -39,6 +41,9 @@ public class review implements Callable<Integer> {
 
     @Option(names = {"-t", "--token"}, description = "Github token to use when calling the Github API")
     private String token;
+
+    @Option(names = {"-v", "--verbose"}, description = "Enable verbose output.")
+    private boolean verbose;
 
     public static void main(String... args) {
         int exitCode = new CommandLine(new review()).execute(args);
@@ -173,13 +178,24 @@ public class review implements Callable<Integer> {
 
             if (!prPatch.equals(upstreamPatch)) {
                 out.println("❌ Diffs do not match!");
-                out.println("PR Diff:\n" + prPatch);
-                out.println("Upstream Diff:\n" + upstreamPatch);
+                if (verbose) {
+                    Path tempDir = Files.createTempDirectory("review");
+                    Path upstreamPath = tempDir.resolve("upstream.patch");
+                    Path prPath = tempDir.resolve("pr.patch");
+                    Files.write(upstreamPath, upstreamPatch.getBytes(StandardCharsets.UTF_8));
+                    Files.write(prPath, prPatch.getBytes(StandardCharsets.UTF_8));
+                    ProcessBuilder pb = new ProcessBuilder("git", "diff", "-U0", "--no-index", upstreamPath.toString(), prPath.toString());
+                    pb.inheritIO();
+                    Process process = pb.start();
+                    process.waitFor();
+                }
             } else {
                 out.println("✅ Diffs match.");
             }
         } catch (IOException e) {
             out.println("❌ Failed to fetch or compare diffs: " + e.getMessage());
+        } catch (InterruptedException e) {
+            out.println("❌ Diff comparison was interrupted: " + e.getMessage());
         }
     }
 
