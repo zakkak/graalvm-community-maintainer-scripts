@@ -5,6 +5,7 @@
 import static java.lang.System.out;
 
 import java.io.IOException;
+import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -22,6 +23,7 @@ import org.kohsuke.github.GHPullRequestCommitDetail;
 import org.kohsuke.github.GHRepository;
 import org.kohsuke.github.GitHub;
 import org.kohsuke.github.GitHubBuilder;
+
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -135,6 +137,65 @@ public class review implements Callable<Integer> {
         out.println(description);
     }
 
+    private void checkIndividualCommitDiffs(GHPullRequest pr, GHPullRequest upstreamPR) throws IOException {
+        GHRepository upstreamRepo = github.getRepository(upstreamRepository);
+
+        for (GHPullRequestCommitDetail backportCommit : pr.listCommits()) {
+            String message = backportCommit.getCommit().getMessage();
+            String cherryPickRegex = "\\(cherry picked from commit ([a-f0-9]{40})\\)";
+            Matcher matcher = Pattern.compile(cherryPickRegex).matcher(message);
+
+            if (!matcher.find()) {
+                out.println("⚠️  Skipping commit " + backportCommit.getSha() + " (not a cherry-pick)");
+                continue;
+            }
+
+            String upstreamSHA = matcher.group(1);
+            try {
+                // Get patches for both commits
+                String backportPatch = fetchCommitPatch(backportCommit.getSha(), pr.getRepository());
+                String upstreamPatch = fetchCommitPatch(upstreamSHA, upstreamRepo);
+
+                // Normalize patches (filter only +/- lines and ignore --- and +++ lines)
+                backportPatch = backportPatch.lines()
+                    .filter(line -> (line.startsWith("-") || line.startsWith("+")) && !line.startsWith("---") && !line.startsWith("+++"))
+                    .collect(Collectors.joining("\n"));
+
+                upstreamPatch = upstreamPatch.lines()
+                    .filter(line -> (line.startsWith("-") || line.startsWith("+")) && !line.startsWith("---") && !line.startsWith("+++"))
+                    .collect(Collectors.joining("\n"));
+
+                if (!backportPatch.equals(upstreamPatch)) {
+                    out.println("❌ Commit " + backportCommit.getSha() + " differs from upstream " + upstreamSHA);
+                    if (verbose) {
+                        Path tempDir = Files.createTempDirectory("commit-review");
+                        Path upstreamPath = tempDir.resolve("upstream-" + upstreamSHA.substring(0, 7) + ".patch");
+                        Path backportPath = tempDir.resolve("backport-" + backportCommit.getSha().substring(0, 7) + ".patch");
+                        Files.write(upstreamPath, upstreamPatch.getBytes(StandardCharsets.UTF_8));
+                        Files.write(backportPath, backportPatch.getBytes(StandardCharsets.UTF_8));
+                        ProcessBuilder pb = new ProcessBuilder("git", "diff", "-U0", "--no-index", upstreamPath.toString(), backportPath.toString());
+                        pb.inheritIO();
+                        Process process = pb.start();
+                        process.waitFor();
+                    }
+                } else {
+                    out.println("✅ Commit " + backportCommit.getSha() + " matches upstream " + upstreamSHA);
+                }
+            } catch (IOException | InterruptedException e) {
+                out.println("❌ Failed to compare commit " + backportCommit.getSha() + " with upstream " + upstreamSHA + ": " + e.getMessage());
+            }
+        }
+    }
+
+    private String fetchCommitPatch(String sha, GHRepository repo) throws IOException {
+        try {
+            URL patchUrl = URI.create(repo.getHtmlUrl() + "/commit/" + sha + ".patch").toURL();
+            return new String(patchUrl.openConnection().getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            throw new IOException("Failed to fetch patch for commit " + sha, e);
+        }
+    }
+
     private void checkBackportCommits(GHPullRequest pr, GHPullRequest upstreamPR) {
         List<String> upstreamCommitSHAs = new ArrayList<>();
         for (GHPullRequestCommitDetail commit : upstreamPR.listCommits()) {
@@ -189,6 +250,9 @@ public class review implements Callable<Integer> {
                     Process process = pb.start();
                     process.waitFor();
                 }
+                // Iterate over commits and check their diffs with the referenced as cherry-picked ones in the commit message
+                out.println("Checking individual commit diffs...");
+                checkIndividualCommitDiffs(pr, pullRequest);
             } else {
                 out.println("✅ Diffs match.");
             }
