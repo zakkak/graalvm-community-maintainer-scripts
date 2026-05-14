@@ -160,6 +160,7 @@ public class review implements Callable<Integer> {
                 backportPatch = backportPatch.lines()
                     .filter(line -> (line.startsWith("-") || line.startsWith("+")) && !line.startsWith("---") && !line.startsWith("+++"))
                     .collect(Collectors.joining("\n"));
+                backportPatch = normalizePatch(backportPatch);
 
                 upstreamPatch = upstreamPatch.lines()
                     .filter(line -> (line.startsWith("-") || line.startsWith("+")) && !line.startsWith("---") && !line.startsWith("+++"))
@@ -185,6 +186,19 @@ public class review implements Callable<Integer> {
                 out.println("❌ Failed to compare commit " + backportCommit.getSha() + " with upstream " + upstreamSHA + ": " + e.getMessage());
             }
         }
+    }
+
+    private String normalizePatch(String patch) {
+        // graalvm-community-jdk21u uses different package and path conventions than oracle/graal.
+        // Normalize to upstream names so diffs that differ only in these structural aspects are
+        // not flagged as mismatches.
+        return patch
+            // Package/import names (dot-separated)
+            .replace("org.graalvm.compiler", "jdk.graal.compiler")
+            .replace("jdk.internal.vm.compiler", "jdk.graal.compiler")
+            // File paths (slash-separated)
+            .replace("org/graalvm/compiler", "jdk/graal/compiler")
+            .replace("jdk/internal/vm/compiler", "jdk/graal/compiler");
     }
 
     private String fetchCommitPatch(String sha, GHRepository repo) throws IOException {
@@ -230,11 +244,12 @@ public class review implements Callable<Integer> {
             String upstreamPatch = new String(upstreamDiffUrl.openConnection().getInputStream().readAllBytes(), StandardCharsets.UTF_8);
 
             prPatch = prPatch.lines()
-                .filter(line -> line.startsWith("-") || line.startsWith("+"))
+                .filter(line -> (line.startsWith("-") || line.startsWith("+")) && !line.startsWith("---") && !line.startsWith("+++"))
                 .collect(Collectors.joining("\n"));
+            prPatch = normalizePatch(prPatch);
 
             upstreamPatch = upstreamPatch.lines()
-                .filter(line -> line.startsWith("-") || line.startsWith("+"))
+                .filter(line -> (line.startsWith("-") || line.startsWith("+")) && !line.startsWith("---") && !line.startsWith("+++"))
                 .collect(Collectors.joining("\n"));
 
             if (!prPatch.equals(upstreamPatch)) {
