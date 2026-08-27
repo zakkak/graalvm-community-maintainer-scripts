@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -115,6 +116,9 @@ class prepare_sync_pr implements Callable<Integer> {
     private static final Pattern BACKPORT_PREFIX = Pattern.compile("^Backport to [^:]+:\\s*");
     private static final Pattern CHERRY_PICK = Pattern.compile("cherry picked from commit ([a-f0-9]{40})");
     private static final Pattern QUOTED = Pattern.compile("'([^']+)'");
+    // A GitHub closing keyword ("Closes #12", "fixes #34", ...) referencing an issue in the same repo.
+    private static final Pattern CLOSES_KEYWORD =
+            Pattern.compile("(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s*:?\\s+#(\\d+)");
 
     @Override
     public Integer call() throws Exception {
@@ -154,7 +158,8 @@ class prepare_sync_pr implements Callable<Integer> {
                 }
                 oldBase = merge.getParent(0).getId();
                 upstreamTip = merge.getParent(1).getId();
-                err.println("Old base: " + oldBase.name() + "   Upstream tip: " + upstreamTip.name());
+                err.println("Old base: " + oldBase.name());
+                err.println("Upstream tip: " + upstreamTip.name());
 
                 // Derive the upstream branch name from the merge subject, which looks like:
                 //   Merge upstream 'release/graal-vm/25.0' branch (tag vm-25.0.3)
@@ -267,70 +272,195 @@ class prepare_sync_pr implements Callable<Integer> {
 
             // ── Step 2: Classify each upstream PR against the downstream repo ──
             List<String> already = new ArrayList<>();
+            List<String> partial = new ArrayList<>();
             List<String> knownOpen = new ArrayList<>();
             List<String> unknown = new ArrayList<>();
-            List<Integer> supersededPrs = new ArrayList<>();   // open backport PRs this sync replaces
-            List<Integer> closesIssues = new ArrayList<>();    // open backport issues to auto-close
+            Set<Integer> supersededPrs = new LinkedHashSet<>();   // open backport PRs this sync replaces
+            Set<Integer> closesIssues = new LinkedHashSet<>();    // open backport issues to auto-close
 
             for (int prNum : touched) {
                 String upstreamPrUrl = prUrl.get(prNum);
-                String matchState = null;   // "already" | "open"
+                String matchState = null;   // "already" | "partial" | "open"
                 String matchRef = null;
                 boolean openIsPr = false;   // when open: is the downstream match a PR or an issue?
                 int openNumber = -1;
+                String openBody = null;     // when open & a PR: its body, to find the tracking issue
+                int totalCommits = 0;       // for partial-backport accounting
+                int backportedCommits = 0;
+                List<String> missingCommits = new ArrayList<>();
 
-                // 2a: cherry-pick trailer match against the PR's *original* commit SHAs
+                // 2a: cherry-pick trailer match against the PR's *original* commit SHAs. Count how
+                // many of the PR's commits landed downstream: all -> already backported; some -> a
+                // partial backport (only specific commits were cherry-picked).
                 GHPullRequest upr = upstreamRepo.getPullRequest(prNum);
                 for (GHPullRequestCommitDetail cd : upr.listCommits()) {
+                    totalCommits++;
                     String downstreamSha = cherryPicks.get(cd.getSha());
                     if (downstreamSha != null) {
-                        matchState = "already";
-                        matchRef = downstreamPrForCommit(downstreamRepo, downstreamSha);
-                        break;
+                        backportedCommits++;
+                        if (matchRef == null) {
+                            matchRef = downstreamPrForCommit(downstreamRepo, downstreamSha);
+                        }
+                    } else {
+                        missingCommits.add(cd.getSha());
                     }
+                }
+                if (backportedCommits > 0) {
+                    matchState = backportedCommits == totalCommits ? "already" : "partial";
                 }
 
                 // 2b: fall back to searching downstream issues/PRs referencing the upstream PR URL.
                 // Deliberately NOT filtered by label:backport — the label is often only on the
-                // tracking issue, not the PR that closes it (or vice versa). Prefer an OPEN match:
-                // an outstanding backport is the actionable state, so a closed reference must not
-                // hide it. (merged vs closed doesn't matter here; both mean "already".)
+                // tracking issue, not the PR that closes it (or vice versa). Categorize every
+                // candidate and pick by priority, since the search can return both a tracking issue
+                // and its backport PR at once:
+                //   merged PR  -> already backported (the definitive ref — a PR, not the issue)
+                //   open PR    -> in-progress backport this sync supersedes
+                //   open issue -> outstanding backport request this sync closes
+                //   closed issue -> already backported (best signal when no PR is found)
+                // A closed-but-unmerged PR is an abandoned attempt: ignored entirely.
                 if (matchState == null) {
-                    GHIssue best = null;
+                    GHPullRequest mergedPr = null;
+                    GHIssue openPr = null;
+                    GHIssue openIssue = null;
+                    GHIssue closedIssue = null;
                     for (GHIssue it : github.searchIssues()
                             .q("repo:" + repository + " \"" + upstreamPrUrl + "\" in:body").list()) {
-                        if (it.getState() == GHIssueState.OPEN) {
-                            best = it;
-                            break;
-                        }
-                        if (best == null) {
-                            best = it;
+                        if (it.isPullRequest()) {
+                            if (it.getState() == GHIssueState.OPEN) {
+                                if (openPr == null) {
+                                    openPr = it;
+                                }
+                            } else if (mergedPr == null) {
+                                GHPullRequest pr = downstreamRepo.getPullRequest(it.getNumber());
+                                if (pr.isMerged()) {
+                                    mergedPr = pr;
+                                }
+                            }
+                        } else if (it.getState() == GHIssueState.OPEN) {
+                            if (openIssue == null) {
+                                openIssue = it;
+                            }
+                        } else if (closedIssue == null) {
+                            closedIssue = it;
                         }
                     }
-                    if (best != null) {
-                        if (best.getState() == GHIssueState.OPEN) {
-                            matchState = "open";
-                            openIsPr = best.isPullRequest();
-                            openNumber = best.getNumber();
-                        } else {
-                            matchState = "already";
-                        }
-                        matchRef = best.getHtmlUrl().toString();
+                    if (mergedPr != null) {
+                        matchState = "already";
+                        matchRef = mergedPr.getHtmlUrl().toString();
+                    } else if (openPr != null) {
+                        matchState = "open";
+                        openIsPr = true;
+                        openNumber = openPr.getNumber();
+                        openBody = openPr.getBody();
+                        matchRef = openPr.getHtmlUrl().toString();
+                    } else if (openIssue != null) {
+                        matchState = "open";
+                        openIsPr = false;
+                        openNumber = openIssue.getNumber();
+                        openBody = openIssue.getBody();
+                        matchRef = openIssue.getHtmlUrl().toString();
+                    } else if (closedIssue != null) {
+                        matchState = "already";
+                        matchRef = closedIssue.getHtmlUrl().toString();
                     }
                 }
 
                 if ("already".equals(matchState)) {
                     already.add("* " + upstreamPrUrl + "\n  (already backported with " + matchRef + ")");
+                } else if ("partial".equals(matchState)) {
+                    StringBuilder e = new StringBuilder();
+                    e.append("* ").append(upstreamPrUrl)
+                            .append("\n  (partially backported with ").append(matchRef).append(" — ")
+                            .append(backportedCommits).append(" of ").append(totalCommits)
+                            .append(" commits; not yet backported:");
+                    for (String sha : missingCommits) {
+                        e.append("\n    * https://github.com/").append(upstreamRepository)
+                                .append("/commit/").append(sha);
+                    }
+                    e.append(")");
+                    partial.add(e.toString());
                 } else if ("open".equals(matchState)) {
                     if (openIsPr) {
                         knownOpen.add("* " + upstreamPrUrl + "\n  (open backport PR " + matchRef + ")");
                         supersededPrs.add(openNumber);
+                        // Superseding a backport PR also closes the backport issue it tracks, so
+                        // this sync PR takes over closing it (the PR itself won't merge).
+                        int trackingIssue = extractBackportIssue(openBody);
+                        if (trackingIssue != -1) {
+                            closesIssues.add(trackingIssue);
+                        }
                     } else {
                         knownOpen.add("* " + upstreamPrUrl + "\n  (open backport issue " + matchRef + ")");
                         closesIssues.add(openNumber);
                     }
                 } else {
                     unknown.add("* " + upstreamPrUrl);
+                }
+            }
+
+            // ── Step 2c: close open backport requests that asked for specific commits ──
+            // The per-PR search in 2b only matches requests citing the upstream PR URL. A
+            // "partial backport" request instead cites specific upstream commit URLs (often with
+            // abbreviated SHAs, which a full-SHA search can't match). We enumerate the (few) open
+            // backport requests once and close any whose every requested PR/commit is now present
+            // — even when only some of an upstream PR's commits were backported, as long as the
+            // request asked for exactly those. Scoped to this sync: a request is only closed when
+            // at least one thing it asked for is introduced by THIS merge (not solely by an
+            // earlier backport). Matching a requested (possibly abbreviated) SHA against the full
+            // SHAs we hold is a prefix test, which sidesteps the abbreviated-SHA search limitation.
+            Set<String> broughtInShas = new HashSet<>();
+            for (RevCommit c : newCommits) {
+                String s = cherryPickedSha(c);
+                if (s != null) {
+                    broughtInShas.add(s);
+                }
+            }
+            Set<String> presentShas = new HashSet<>(cherryPicks.keySet());
+            presentShas.addAll(broughtInShas);
+
+            for (GHIssue req : openBackportRequests(downstreamRepo)) {
+                int num = req.getNumber();
+                boolean isPr = req.isPullRequest();
+                if (isPr ? supersededPrs.contains(num) : closesIssues.contains(num)) {
+                    continue;   // already handled by 2b
+                }
+                Set<Integer> reqPrs = parseUpstreamPrs(req.getBody());
+                List<String> reqCommits = parseUpstreamCommits(req.getBody());
+                if (reqPrs.isEmpty() && reqCommits.isEmpty()) {
+                    continue;
+                }
+
+                boolean relevant = false;   // asks for something this sync actually introduces
+                boolean satisfied = true;   // everything it asks for is now present
+                for (int n : reqPrs) {
+                    if (touched.contains(n)) {
+                        relevant = true;
+                    }
+                    if (!prFullyPresent(upstreamRepo, n, presentShas)) {
+                        satisfied = false;
+                    }
+                }
+                for (String sha : reqCommits) {
+                    if (commitPresent(sha, broughtInShas)) {
+                        relevant = true;
+                    }
+                    if (!commitPresent(sha, presentShas)) {
+                        satisfied = false;
+                    }
+                }
+                if (!relevant || !satisfied) {
+                    continue;
+                }
+
+                if (isPr) {
+                    supersededPrs.add(num);
+                    int trackingIssue = extractBackportIssue(req.getBody());
+                    if (trackingIssue != -1) {
+                        closesIssues.add(trackingIssue);
+                    }
+                } else {
+                    closesIssues.add(num);
                 }
             }
 
@@ -345,8 +475,8 @@ class prepare_sync_pr implements Callable<Integer> {
             }
 
             // ── Output ─────────────────────────────────────────────────────
-            String body = renderBody(upstreamBranch, already, knownOpen, unknown, otherGroups, ambiguous,
-                    supersededPrs, closesIssues);
+            String body = renderBody(upstreamBranch, already, partial, knownOpen, unknown, otherGroups,
+                    ambiguous, supersededPrs, closesIssues);
             out.print(body);
 
             Path bodyFile = Files.createTempFile("pr-body", ".md");
@@ -574,14 +704,107 @@ class prepare_sync_pr implements Callable<Integer> {
     private String downstreamPrForCommit(GHRepository downstreamRepo, String sha) {
         try {
             GHCommit commit = downstreamRepo.getCommit(sha);
-            List<GHPullRequest> pulls = commit.listPullRequests().toList();
-            if (!pulls.isEmpty()) {
-                return pulls.get(0).getHtmlUrl().toString();
+            GHPullRequest openPr = null;
+            for (GHPullRequest pr : commit.listPullRequests()) {
+                if (pr.isMerged()) {
+                    return pr.getHtmlUrl().toString();   // a merged PR is the definitive ref
+                }
+                if (openPr == null && pr.getState() == GHIssueState.OPEN) {
+                    openPr = pr;   // keep an open PR as a fallback; skip closed-unmerged (abandoned)
+                }
+            }
+            if (openPr != null) {
+                return openPr.getHtmlUrl().toString();
             }
         } catch (IOException e) {
             // fall through to reporting the raw SHA
         }
         return sha + " (no PR found via API)";
+    }
+
+    /** Open issues and PRs in the downstream repo that reference the upstream repo (candidate backport requests). */
+    private List<GHIssue> openBackportRequests(GHRepository repo) throws IOException {
+        List<GHIssue> result = new ArrayList<>();
+        for (GHIssue it : repo.getIssues(GHIssueState.OPEN)) {
+            String body = it.getBody();
+            if (body != null && (body.contains(upstreamRepository + "/pull/")
+                    || body.contains(upstreamRepository + "/commit/"))) {
+                result.add(it);
+            }
+        }
+        return result;
+    }
+
+    /** Upstream PR numbers referenced by "…/pull/NN" URLs in a request body. */
+    private Set<Integer> parseUpstreamPrs(String body) {
+        Set<Integer> prs = new LinkedHashSet<>();
+        if (body == null) {
+            return prs;
+        }
+        Matcher m = Pattern.compile(Pattern.quote(upstreamRepository) + "/pull/(\\d+)").matcher(body);
+        while (m.find()) {
+            prs.add(Integer.parseInt(m.group(1)));
+        }
+        return prs;
+    }
+
+    /** Upstream commit SHAs (possibly abbreviated) referenced by "…/commit/SHA" URLs in a request body. */
+    private List<String> parseUpstreamCommits(String body) {
+        List<String> shas = new ArrayList<>();
+        if (body == null) {
+            return shas;
+        }
+        Matcher m = Pattern.compile(Pattern.quote(upstreamRepository) + "/commit/([a-f0-9]{7,40})").matcher(body);
+        while (m.find()) {
+            shas.add(m.group(1));
+        }
+        return shas;
+    }
+
+    /** Whether {@code abbrev} (a full or abbreviated SHA) is a prefix of any full SHA in {@code shas}. */
+    private static boolean commitPresent(String abbrev, Set<String> shas) {
+        for (String s : shas) {
+            if (s.startsWith(abbrev)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether every commit of upstream PR {@code prNum} is among {@code presentShas} (false on error/empty). */
+    private boolean prFullyPresent(GHRepository upstreamRepo, int prNum, Set<String> presentShas) {
+        try {
+            GHPullRequest pr = upstreamRepo.getPullRequest(prNum);
+            boolean any = false;
+            for (GHPullRequestCommitDetail cd : pr.listCommits()) {
+                any = true;
+                if (!presentShas.contains(cd.getSha())) {
+                    return false;
+                }
+            }
+            return any;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * The downstream backport issue a PR body tracks — a full "…/issues/NN" URL for this repo, or a
+     * "Closes #NN"-style keyword — or -1 if none is found.
+     */
+    private int extractBackportIssue(String body) {
+        if (body == null) {
+            return -1;
+        }
+        Matcher url = Pattern.compile("github\\.com/" + Pattern.quote(repository) + "/issues/(\\d+)").matcher(body);
+        if (url.find()) {
+            return Integer.parseInt(url.group(1));
+        }
+        Matcher kw = CLOSES_KEYWORD.matcher(body);
+        if (kw.find()) {
+            return Integer.parseInt(kw.group(1));
+        }
+        return -1;
     }
 
     private static String classifyKeyword(String subject) {
@@ -605,15 +828,16 @@ class prepare_sync_pr implements Callable<Integer> {
 
     // ── Output rendering ─────────────────────────────────────────────────────
 
-    private String renderBody(String upstreamBranch, List<String> already, List<String> knownOpen,
-            List<String> unknown, Map<String, List<String>> otherGroups, List<String> ambiguous,
-            List<Integer> supersededPrs, List<Integer> closesIssues) {
+    private String renderBody(String upstreamBranch, List<String> already, List<String> partial,
+            List<String> knownOpen, List<String> unknown, Map<String, List<String>> otherGroups,
+            List<String> ambiguous, Set<Integer> supersededPrs, Set<Integer> closesIssues) {
         StringBuilder b = new StringBuilder();
         b.append("The GraalVM team has synced their internal repositories with their public branch `")
                 .append(upstreamBranch).append("`\n\n");
         b.append("This merge includes the following changes:\n\n");
 
         section(b, "Already backported/merged in this repository", already);
+        section(b, "Partially backported in this repository (only specific commits)", partial);
         section(b, "Known but not backported/merged in this repository", knownOpen);
         section(b, "Previously unknown backports (i.e. not reported on this repository)", unknown);
 
