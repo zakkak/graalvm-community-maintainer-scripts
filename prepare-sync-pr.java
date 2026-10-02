@@ -2,7 +2,7 @@
 //DEPS org.kohsuke:github-api:1.330
 //DEPS info.picocli:picocli:4.7.7
 //DEPS org.eclipse.jgit:org.eclipse.jgit:7.7.1.202607240634-r
-//DEPS org.slf4j:slf4j-nop:2.0.18
+//DEPS org.slf4j:slf4j-nop:2.0.20
 //JAVA 17+
 
 import static java.lang.System.err;
