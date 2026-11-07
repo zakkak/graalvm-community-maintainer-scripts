@@ -1,7 +1,7 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
 //DEPS org.kohsuke:github-api:1.330
 //DEPS info.picocli:picocli:4.7.7
-//DEPS org.eclipse.jgit:org.eclipse.jgit:7.7.1.202607240634-r
+//DEPS org.eclipse.jgit:org.eclipse.jgit:7.8.1.202611041320-r
 //DEPS org.slf4j:slf4j-nop:2.0.18
 //JAVA 17+
 
